@@ -2,15 +2,16 @@ package pkg
 
 import (
 	"context"
-	v12 "k8s.io/api/networking/v1"
+	apiCoreV1 "k8s.io/api/core/v1"
+	netV1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	v13 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	informer "k8s.io/client-go/informers/core/v1"
-	netInformer "k8s.io/client-go/informers/networking/v1"
+	informersCoreV1 "k8s.io/client-go/informers/core/v1"
+	informersNetV1 "k8s.io/client-go/informers/networking/v1"
 	"k8s.io/client-go/kubernetes"
-	coreLister "k8s.io/client-go/listers/core/v1"
+	coreV1 "k8s.io/client-go/listers/core/v1"
 	v1 "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -20,134 +21,144 @@ import (
 )
 
 const (
-	workNum  = 5
-	maxRetry = 3
+	workNum  = 5  // 工作的节点数
+	maxRetry = 10 // 最大重试次数
 )
 
-type controller struct {
+// 定义控制器
+type Controller struct {
 	client        kubernetes.Interface
 	ingressLister v1.IngressLister
-	serviceLister coreLister.ServiceLister
+	serviceLister coreV1.ServiceLister
 	queue         workqueue.RateLimitingInterface
 }
 
-func (c *controller) updateService(oldObj interface{}, newObj interface{}) {
-
-	if reflect.DeepEqual(oldObj, newObj) {
-		return
+// 初始化控制器
+func NewController(client kubernetes.Interface, serviceInformer informersCoreV1.ServiceInformer, ingressInformer informersNetV1.IngressInformer) Controller {
+	c := Controller{
+		client:        client,
+		ingressLister: ingressInformer.Lister(),
+		serviceLister: serviceInformer.Lister(),
+		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ingressManager"),
 	}
-	key, _ := cache.MetaNamespaceIndexFunc(newObj)
-	log.Print("[UPDATE_SERVICE] ----------->>>>>>>>>>>>> ", key)
 
-	c.enqueue(newObj)
+	// 添加事件处理函数
+	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addService,
+		UpdateFunc: c.updateService,
+	})
+
+	ingressInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: c.deleteIngress,
+	})
+	return c
 }
 
-func (c *controller) addService(obj interface{}) {
+// 入队
+func (c *Controller) enqueue(obj interface{}) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		runtime.HandleError(err)
+	}
+	c.queue.Add(key)
+}
 
-	key, _ := cache.MetaNamespaceIndexFunc(obj)
-	log.Print("[ADD_SERVICE] ----------->>>>>>>>>>>>> ", key)
-
+func (c *Controller) addService(obj interface{}) {
 	c.enqueue(obj)
 }
 
-func (c *controller) enqueue(obj interface{}) {
-
-	c.queue.Add(obj)
+func (c *Controller) updateService(oldObj, newObj interface{}) {
+	// todo 比较annotation
+	// 这里只是比较了对象是否相同，如果相同，直接返回
+	if reflect.DeepEqual(oldObj, newObj) {
+		return
+	}
+	c.enqueue(newObj)
 }
 
-func (c *controller) deleteIngress(obj interface{}) {
-	ingress := obj.(*v12.Ingress)
-	service := v13.GetControllerOf(ingress)
-
-	if service != nil {
+func (c *Controller) deleteIngress(obj interface{}) {
+	ingress := obj.(*netV1.Ingress)
+	ownerReference := metaV1.GetControllerOf(ingress)
+	if ownerReference == nil {
 		return
 	}
 
-	if service.Kind != "Service" {
+	// 判断是否为真的service
+	if ownerReference.Kind != "Service" {
 		return
 	}
 
 	c.queue.Add(ingress.Namespace + "/" + ingress.Name)
 }
 
-func (c *controller) Run(stopCh chan struct{}) {
+// 启动控制器，可以看到开了五个协程，真正干活的是worker
+func (c *Controller) Run(stopCh chan struct{}) {
 	for i := 0; i < workNum; i++ {
 		go wait.Until(c.worker, time.Minute, stopCh)
 	}
 	<-stopCh
 }
 
-func (c *controller) worker() {
+func (c *Controller) worker() {
 	for c.processNextItem() {
-
 	}
 }
 
-func (c *controller) processNextItem() bool {
+// 业务真正处理的地方
+func (c *Controller) processNextItem() bool {
+	// 获取key
 	item, shutdown := c.queue.Get()
-
 	if shutdown {
 		return false
 	}
-
 	defer c.queue.Done(item)
 
-	//key := item.(string)
-	err := c.syncService(item)
-
+	// 调用业务逻辑
+	err := c.syncService(item.(string))
 	if err != nil {
-		c.handleError(item, err)
+		// 对错误进行处理
+		c.handlerError(item.(string), err)
+		return false
 	}
-
 	return true
 }
 
-func (c *controller) syncService(obj interface{}) error {
-	key, err := cache.MetaNamespaceIndexFunc(obj)
-	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> key:{} ", key)
+func (c *Controller) syncService(item string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(item)
+	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> namespace: ", namespace)
+	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> name: ", name)
 	if err != nil {
 		return err
 	}
-
-	namespaceKey, name, err := cache.SplitMetaNamespaceKey(key[0])
-
-	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> namespaceKey:{} ", namespaceKey)
-	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> name:{} ", name)
-
+	// 获取service
+	service, err := c.serviceLister.Services(namespace).Get(name)
 	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
 		return err
 	}
 
-	// delete
-	service, err := c.serviceLister.Services(namespaceKey).Get(name)
-	if errors.IsNotFound(err) {
-		return nil
-	}
+	// 新增和删除
+	serviceAnnotations, ok := service.GetAnnotations()["ingress/http"]
+	log.Print("[SYNC_SERVICE] ------->>>>>>>>>>>>>>> serviceAnnotations: ", serviceAnnotations)
 
-	if err != nil {
-		return err
-	}
-
-	// add and delete
-	keyMap, ok := service.GetAnnotations()["ingress/http"]
-	log.Print("[ANNOTATIONS] ------->>>>>>>>>>>>>>> ", keyMap)
-
-	// name modify
-	ingress, err := c.ingressLister.Ingresses(namespaceKey).Get(name)
+	ingress, err := c.ingressLister.Ingresses(namespace).Get(name)
 	if err != nil && !errors.IsNotFound(err) {
 		return err
 	}
 
 	if ok && errors.IsNotFound(err) {
-		// create ingress
-		ig := c.constructIngress(namespaceKey, name)
-		_, err := c.client.NetworkingV1().Ingresses(namespaceKey).Create(context.TODO(), ig, v13.CreateOptions{})
+		// 创建ingress
+		ig := c.constructIngress(service)
+		_, err := c.client.NetworkingV1().Ingresses(namespace).Create(context.TODO(), ig, metaV1.CreateOptions{})
+
 		if err != nil {
 			return err
 		}
 	} else if !ok && ingress != nil {
-		// delete ingress
-		err := c.client.NetworkingV1().Ingresses(namespaceKey).Delete(context.TODO(), name, v13.DeleteOptions{})
+		// 删除ingress
+		err := c.client.NetworkingV1().Ingresses(namespace).Delete(context.TODO(), name, metaV1.DeleteOptions{})
 		if err != nil {
 			return err
 		}
@@ -155,43 +166,39 @@ func (c *controller) syncService(obj interface{}) error {
 	return nil
 }
 
-func (c *controller) handleError(obj interface{}, err error) {
-	key, err := cache.MetaNamespaceIndexFunc(obj)
-	if err != nil {
-		return
-	}
-	log.Print("[HANDLE_NAMESPACE] ----------->>>>>>>>>>>>> ", key)
+func (c *Controller) handlerError(key string, err error) {
+	// 如果出现错误，重新加入队列,最大处理10次
 	if c.queue.NumRequeues(key) <= maxRetry {
 		c.queue.AddRateLimited(key)
 		return
 	}
-
 	runtime.HandleError(err)
-
 	c.queue.Forget(key)
 }
 
-func (c *controller) constructIngress(namespaceKey string, name string) *v12.Ingress {
-	ingress := v12.Ingress{}
-
-	ingress.Name = name
-	ingress.Namespace = namespaceKey
-	pathType := v12.PathTypePrefix
-
-	ingress.Spec = v12.IngressSpec{
-		Rules: []v12.IngressRule{
+func (c *Controller) constructIngress(service *apiCoreV1.Service) *netV1.Ingress {
+	// 构造ingress
+	pathType := netV1.PathTypePrefix
+	ingress := netV1.Ingress{}
+	ingress.ObjectMeta.OwnerReferences = []metaV1.OwnerReference{
+		*metaV1.NewControllerRef(service, apiCoreV1.SchemeGroupVersion.WithKind("Service")),
+	}
+	ingress.Namespace = service.Namespace
+	ingress.Name = service.Name
+	ingress.Spec = netV1.IngressSpec{
+		Rules: []netV1.IngressRule{
 			{
 				Host: "example.com",
-				IngressRuleValue: v12.IngressRuleValue{
-					HTTP: &v12.HTTPIngressRuleValue{
-						Paths: []v12.HTTPIngressPath{
+				IngressRuleValue: netV1.IngressRuleValue{
+					HTTP: &netV1.HTTPIngressRuleValue{
+						Paths: []netV1.HTTPIngressPath{
 							{
 								Path:     "/",
 								PathType: &pathType,
-								Backend: v12.IngressBackend{
-									Service: &v12.IngressServiceBackend{
-										Name: name,
-										Port: v12.ServiceBackendPort{
+								Backend: netV1.IngressBackend{
+									Service: &netV1.IngressServiceBackend{
+										Name: service.Name,
+										Port: netV1.ServiceBackendPort{
 											Number: 80,
 										},
 									},
@@ -205,24 +212,4 @@ func (c *controller) constructIngress(namespaceKey string, name string) *v12.Ing
 	}
 
 	return &ingress
-}
-
-func NewController(client kubernetes.Interface, serviceInformer informer.ServiceInformer, ingressInformer netInformer.IngressInformer) controller {
-	c := controller{
-		client:        client,
-		ingressLister: ingressInformer.Lister(),
-		serviceLister: serviceInformer.Lister(),
-		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ingressManager"),
-	}
-
-	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addService,
-		UpdateFunc: c.updateService,
-	})
-
-	ingressInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		DeleteFunc: c.deleteIngress,
-	})
-
-	return c
 }
